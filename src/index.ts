@@ -11,6 +11,7 @@
  *   active  — suppress replies when policy recommends it
  */
 import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { featureFlagsForMode } from "./config.js";
 import { createPolicyFeedbackEngine, type PolicyFeedbackEngineImpl } from "./engine.js";
 import {
   clearPolicyFeedbackEngine,
@@ -21,7 +22,66 @@ import {
   setPolicyFeedbackEngine,
 } from "./gateway-bridge.js";
 import { pruneOldRecords } from "./persistence.js";
+import { parseAgentSessionKey } from "./session-utils.js";
 import type { PolicyMode } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// In-memory state for correlating received → sent → outcome
+// ---------------------------------------------------------------------------
+
+type PendingAction = {
+  sessionKey: string;
+  channelId: string;
+  from: string;
+  receivedAt: number;
+  accountId?: string;
+};
+
+type ConfirmedAction = {
+  actionId: string;
+  sessionKey: string;
+  channelId: string;
+  sentAt: number;
+  correlated: boolean;
+};
+
+const pendingActions = new Map<string, PendingAction>();
+const recentConfirmedActions = new Map<string, ConfirmedAction[]>();
+
+const MAX_CONFIRMED_PER_SESSION = 20;
+const MAX_CORRELATION_AGE_MS = 86_400_000; // 24h
+const MAX_PENDING_AGE_MS = 300_000; // 5m
+const MAX_TOTAL_PENDING = 1000;
+
+function pruneStalePendingActions(): void {
+  try {
+    const now = Date.now();
+    for (const [key, entry] of pendingActions) {
+      if (now - entry.receivedAt > MAX_PENDING_AGE_MS) {
+        pendingActions.delete(key);
+      }
+    }
+    if (pendingActions.size > MAX_TOTAL_PENDING) {
+      const sorted = [...pendingActions.entries()].toSorted(
+        (a, b) => a[1].receivedAt - b[1].receivedAt,
+      );
+      const toRemove = sorted.length - MAX_TOTAL_PENDING;
+      for (let i = 0; i < toRemove; i++) {
+        pendingActions.delete(sorted[i][0]);
+      }
+    }
+  } catch {
+    // never throw
+  }
+}
+
+function resolveAgentId(sessionKey: string): string {
+  return parseAgentSessionKey(sessionKey)?.agentId ?? "default";
+}
+
+// ---------------------------------------------------------------------------
+// Plugin entry
+// ---------------------------------------------------------------------------
 
 export default definePluginEntry({
   id: "dhanoosh",
@@ -53,7 +113,7 @@ export default definePluginEntry({
 
         setPolicyFeedbackEngine(engine, engineMode);
 
-        // Periodic maintenance: recompute aggregates and prune old logs
+        // Periodic maintenance
         const resolvedConfig = engine.getResolvedConfig();
         const capturedEngine = engine;
         maintenanceTimer = setInterval(() => {
@@ -66,13 +126,15 @@ export default definePluginEntry({
         }, resolvedConfig.aggregateIntervalMs);
         maintenanceTimer.unref();
       } catch {
-        // Non-critical — fail silently
+        // Non-critical
       }
     });
 
     // --- gateway_stop: cleanup ---
     api.on("gateway_stop", async () => {
       clearPolicyFeedbackEngine();
+      pendingActions.clear();
+      recentConfirmedActions.clear();
       if (maintenanceTimer) {
         clearInterval(maintenanceTimer);
         maintenanceTimer = null;
@@ -103,19 +165,19 @@ export default definePluginEntry({
     });
 
     // --- before_dispatch: suppress replies in active mode ---
-    api.on("before_dispatch", async (event, ctx) => {
+    api.on("before_dispatch", async (_event, ctx) => {
       if (!isPolicyFeedbackActive()) {
         return;
       }
       try {
         const hints = await getPolicyHintsSafe({
-          agentId: ctx.senderId ?? "default",
+          agentId: resolveAgentId(ctx.sessionKey ?? ""),
           sessionKey: ctx.sessionKey ?? "",
           channelId: ctx.channelId ?? "unknown",
         });
         if (hints.recommendation === "suppress" && hints.mode === "active") {
           logPolicyAction({
-            agentId: ctx.senderId ?? "default",
+            agentId: resolveAgentId(ctx.sessionKey ?? ""),
             sessionKey: ctx.sessionKey ?? "",
             actionType: "suppressed",
             channelId: ctx.channelId ?? "unknown",
@@ -124,43 +186,139 @@ export default definePluginEntry({
           return { handled: true };
         }
       } catch {
-        // Non-critical — allow dispatch to proceed
+        // Non-critical
       }
     });
 
-    // --- message_received: track inbound for outcome correlation ---
+    // --- message_received: store pending + correlate outcomes ---
     api.on("message_received", async (event, ctx) => {
       if (!engine) {
         return;
       }
       try {
-        // Log for outcome correlation — if we recently sent a reply and the
-        // user is now replying, that's a positive outcome signal.
-        logPolicyAction({
-          agentId: ctx.senderId ?? "default",
-          sessionKey: ctx.sessionKey ?? "",
-          actionType: "agent_reply",
-          channelId: ctx.channelId ?? "unknown",
-          contextSummary: `Received from ${event.from}`,
-        });
+        const engineMode = engine.getMode();
+        const flags = featureFlagsForMode(engineMode);
+        if (!flags.enableActionLogging && !flags.enableOutcomeLogging) {
+          return;
+        }
+
+        pruneStalePendingActions();
+
+        const sessionKey = ctx.sessionKey ?? "";
+        const channelId = ctx.channelId ?? "unknown";
+        const agentId = resolveAgentId(sessionKey);
+
+        // 1. Store pending action — will be promoted to agent_reply on message_sent
+        if (flags.enableActionLogging && sessionKey) {
+          pendingActions.set(sessionKey, {
+            sessionKey,
+            channelId,
+            from: event.from ?? "unknown",
+            receivedAt: Date.now(),
+            accountId: ctx.accountId,
+          });
+        }
+
+        // 2. Correlate with prior agent actions → user_replied outcome
+        if (flags.enableOutcomeLogging && sessionKey) {
+          const sessionActions = recentConfirmedActions.get(sessionKey);
+          if (sessionActions) {
+            const now = Date.now();
+            for (const action of sessionActions) {
+              if (action.correlated) continue;
+              const elapsed = now - action.sentAt;
+              if (elapsed > MAX_CORRELATION_AGE_MS) continue;
+
+              action.correlated = true;
+              await engine.logOutcome({
+                actionId: action.actionId,
+                agentId,
+                outcomeType: "user_replied",
+                value: Math.min(1, 1 - elapsed / MAX_CORRELATION_AGE_MS),
+                horizonMs: elapsed,
+                metadata: { channelId: action.channelId },
+              });
+            }
+            // Prune old/correlated entries
+            const pruned = sessionActions.filter(
+              (a) => !a.correlated && now - a.sentAt < MAX_CORRELATION_AGE_MS,
+            );
+            if (pruned.length > 0) {
+              recentConfirmedActions.set(sessionKey, pruned);
+            } else {
+              recentConfirmedActions.delete(sessionKey);
+            }
+          }
+        }
       } catch {
         // Fire-and-forget
       }
     });
 
-    // --- message_sent: log agent reply actions ---
+    // --- message_sent: log agent_reply action + immediate delivery outcome ---
     api.on("message_sent", async (event, ctx) => {
       if (!engine) {
         return;
       }
       try {
-        logPolicyAction({
-          agentId: ctx.senderId ?? "default",
-          sessionKey: ctx.sessionKey ?? "",
-          actionType: "agent_reply",
-          channelId: ctx.channelId ?? "unknown",
-          contextSummary: `Reply to ${event.to}`,
-        });
+        const engineMode = engine.getMode();
+        const flags = featureFlagsForMode(engineMode);
+        if (!flags.enableActionLogging && !flags.enableOutcomeLogging) {
+          return;
+        }
+
+        pruneStalePendingActions();
+
+        const sessionKey = ctx.sessionKey ?? "";
+        const channelId = ctx.channelId ?? "unknown";
+        const agentId = resolveAgentId(sessionKey);
+
+        if (flags.enableActionLogging) {
+          // Promote pending inbound → confirmed agent_reply
+          const pending = pendingActions.get(sessionKey);
+          pendingActions.delete(sessionKey);
+
+          const { actionId } = await engine.logAction({
+            agentId,
+            sessionKey,
+            actionType: "agent_reply",
+            channelId,
+            accountId: ctx.accountId,
+            contextSummary: `Reply to ${pending?.from ?? event.to ?? "unknown"}`,
+            metadata: {
+              to: event.to,
+              hadPendingInbound: Boolean(pending),
+            },
+          });
+
+          // Track for future outcome correlation
+          if (!recentConfirmedActions.has(sessionKey)) {
+            recentConfirmedActions.set(sessionKey, []);
+          }
+          const list = recentConfirmedActions.get(sessionKey)!;
+          list.push({
+            actionId,
+            sessionKey,
+            channelId,
+            sentAt: Date.now(),
+            correlated: false,
+          });
+          if (list.length > MAX_CONFIRMED_PER_SESSION) {
+            list.splice(0, list.length - MAX_CONFIRMED_PER_SESSION);
+          }
+
+          // Log immediate delivery outcome
+          if (flags.enableOutcomeLogging) {
+            const success = (event as Record<string, unknown>).success !== false;
+            await engine.logOutcome({
+              actionId,
+              agentId,
+              outcomeType: success ? "delivery_success" : "delivery_failure",
+              value: success ? 1 : 0,
+              metadata: { channelId },
+            });
+          }
+        }
       } catch {
         // Fire-and-forget
       }
