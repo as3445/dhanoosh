@@ -1,0 +1,23 @@
+{
+  "name": "@as3445/dhanoosh",
+  "version": "0.1.0",
+  "description": "Adaptive policy feedback plugin for OpenClaw — observes agent actions, tracks outcomes, and provides scoring/ranking guidance.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "openclaw": ">=2026.3.22",
+    "vitest": "^3.0.0",
+    "typescript": "^5.8.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.22"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.ts"]
+  }
+}

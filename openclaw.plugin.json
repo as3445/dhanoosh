@@ -1,0 +1,30 @@
+{
+  "id": "dhanoosh",
+  "name": "Dhanoosh",
+  "description": "Adaptive policy layer that observes agent actions and user outcomes, computes effectiveness statistics, and provides scoring/ranking guidance.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["off", "passive", "advisory", "active"],
+        "default": "passive",
+        "description": "Operating mode: off (disabled), passive (observe only), advisory (prompt hints), active (suppress/allow)."
+      },
+      "aggregateIntervalMs": {
+        "type": "number",
+        "minimum": 60000,
+        "default": 3600000,
+        "description": "How often to recompute aggregate statistics (ms)."
+      },
+      "logRetentionDays": {
+        "type": "number",
+        "minimum": 1,
+        "maximum": 365,
+        "default": 90,
+        "description": "How many days to retain action/outcome logs."
+      }
+    }
+  }
+}
