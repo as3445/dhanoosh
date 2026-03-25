@@ -95,8 +95,9 @@ export default definePluginEntry({
     let engine: PolicyFeedbackEngineImpl | null = null;
     let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
 
-    // --- gateway_start: init engine ---
+    // --- gateway_start: init engine + boot notification ---
     api.on("gateway_start", async () => {
+      // 1. Init policy feedback engine
       try {
         engine = await createPolicyFeedbackEngine({
           config: { mode },
@@ -108,25 +109,53 @@ export default definePluginEntry({
         if (engineMode === "off") {
           setPolicyFeedbackEngine(null, "off");
           engine = null;
-          return;
+        } else {
+          setPolicyFeedbackEngine(engine, engineMode);
+
+          // Periodic maintenance
+          const resolvedConfig = engine.getResolvedConfig();
+          const capturedEngine = engine;
+          maintenanceTimer = setInterval(() => {
+            capturedEngine.recomputeAggregates("default").catch(() => {});
+            if (resolvedConfig.logRetentionDays > 0) {
+              pruneOldRecords(resolvedConfig.logRetentionDays, {
+                home: capturedEngine.getHome(),
+              }).catch(() => {});
+            }
+          }, resolvedConfig.aggregateIntervalMs);
+          maintenanceTimer.unref();
         }
-
-        setPolicyFeedbackEngine(engine, engineMode);
-
-        // Periodic maintenance
-        const resolvedConfig = engine.getResolvedConfig();
-        const capturedEngine = engine;
-        maintenanceTimer = setInterval(() => {
-          capturedEngine.recomputeAggregates("default").catch(() => {});
-          if (resolvedConfig.logRetentionDays > 0) {
-            pruneOldRecords(resolvedConfig.logRetentionDays, {
-              home: capturedEngine.getHome(),
-            }).catch(() => {});
-          }
-        }, resolvedConfig.aggregateIntervalMs);
-        maintenanceTimer.unref();
       } catch {
         // Non-critical
+      }
+
+      // 2. Boot notification — send a message via the openclaw CLI
+      // Uses child_process to call `openclaw message send` which goes through
+      // the gateway's normal delivery path. No fragile dist chunk scanning.
+      try {
+        const { execFile } = await import("node:child_process");
+        const now = new Date();
+        const bootMsg = `Just rebooted — back online (${now.toISOString()}). Check inbox and emails if anything came in while I was down.`;
+
+        // Wait a few seconds for Telegram provider to fully connect
+        setTimeout(() => {
+          try {
+            execFile(
+              "openclaw",
+              ["message", "send", "--text", bootMsg],
+              { timeout: 30_000 },
+              (err) => {
+                if (err) {
+                  console.warn(`[dhanoosh] boot notification failed: ${err.message}`);
+                }
+              },
+            );
+          } catch {
+            // Best-effort
+          }
+        }, 5000);
+      } catch {
+        // Boot notification is best-effort — never block gateway start
       }
     });
 
