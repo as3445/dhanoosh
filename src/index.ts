@@ -10,7 +10,7 @@
  *   advisory — inject policy hints into system prompt
  *   active  — suppress replies when policy recommends it
  */
-import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { featureFlagsForMode } from "./config.js";
 import { createPolicyFeedbackEngine, type PolicyFeedbackEngineImpl } from "./engine.js";
 import {
