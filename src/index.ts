@@ -10,7 +10,7 @@
  *   advisory — inject policy hints into system prompt
  *   active  — suppress replies when policy recommends it
  */
-import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { featureFlagsForMode } from "./config.js";
 import { createPolicyFeedbackEngine, type PolicyFeedbackEngineImpl } from "./engine.js";
 import {
@@ -22,15 +22,18 @@ import {
   setPolicyFeedbackEngine,
 } from "./gateway-bridge.js";
 import { pruneOldRecords } from "./persistence.js";
-import { parseAgentSessionKey } from "./session-utils.js";
 import type { PolicyMode } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // In-memory state for correlating received → sent → outcome
 // ---------------------------------------------------------------------------
 
+// Correlation key: use conversationId (chat ID) since PluginHookMessageContext
+// does not include sessionKey. conversationId is always populated and uniquely
+// identifies a conversation across both message_received and message_sent hooks.
+
 type PendingAction = {
-  sessionKey: string;
+  correlationKey: string;
   channelId: string;
   from: string;
   receivedAt: number;
@@ -39,7 +42,7 @@ type PendingAction = {
 
 type ConfirmedAction = {
   actionId: string;
-  sessionKey: string;
+  correlationKey: string;
   channelId: string;
   sentAt: number;
   correlated: boolean;
@@ -75,8 +78,20 @@ function pruneStalePendingActions(): void {
   }
 }
 
-function resolveAgentId(sessionKey: string): string {
-  return parseAgentSessionKey(sessionKey)?.agentId ?? "default";
+/**
+ * Build a correlation key from the hook context.
+ * Uses channelId:conversationId to uniquely identify a conversation.
+ */
+function correlationKey(ctx: { channelId?: string; conversationId?: string }): string {
+  return `${ctx.channelId ?? "unknown"}:${ctx.conversationId ?? "unknown"}`;
+}
+
+/**
+ * Resolve the agent ID. PluginHookMessageContext doesn't expose sessionKey,
+ * so we use the configured agent ID from the engine or fall back to "main".
+ */
+function resolveAgentId(pluginConfig: Record<string, unknown>): string {
+  return (pluginConfig.agentId as string) ?? "main";
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +106,7 @@ export default definePluginEntry({
   register(api: OpenClawPluginApi) {
     const pluginConfig = api.pluginConfig ?? {};
     const mode = (pluginConfig.mode as PolicyMode) ?? "passive";
+    const agentId = resolveAgentId(pluginConfig);
 
     let engine: PolicyFeedbackEngineImpl | null = null;
     let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
@@ -101,7 +117,7 @@ export default definePluginEntry({
       try {
         engine = await createPolicyFeedbackEngine({
           config: { mode },
-          agentId: "default",
+          agentId,
         });
         engine.start();
 
@@ -116,7 +132,7 @@ export default definePluginEntry({
           const resolvedConfig = engine.getResolvedConfig();
           const capturedEngine = engine;
           maintenanceTimer = setInterval(() => {
-            capturedEngine.recomputeAggregates("default").catch(() => {});
+            capturedEngine.recomputeAggregates(agentId).catch(() => {});
             if (resolvedConfig.logRetentionDays > 0) {
               pruneOldRecords(resolvedConfig.logRetentionDays, {
                 home: capturedEngine.getHome(),
@@ -199,15 +215,16 @@ export default definePluginEntry({
         return;
       }
       try {
+        const key = correlationKey(ctx);
         const hints = await getPolicyHintsSafe({
-          agentId: resolveAgentId(ctx.sessionKey ?? ""),
-          sessionKey: ctx.sessionKey ?? "",
+          agentId,
+          sessionKey: key,
           channelId: ctx.channelId ?? "unknown",
         });
         if (hints.recommendation === "suppress" && hints.mode === "active") {
           logPolicyAction({
-            agentId: resolveAgentId(ctx.sessionKey ?? ""),
-            sessionKey: ctx.sessionKey ?? "",
+            agentId,
+            sessionKey: key,
             actionType: "suppressed",
             channelId: ctx.channelId ?? "unknown",
             contextSummary: "Reply suppressed by policy feedback",
@@ -233,14 +250,13 @@ export default definePluginEntry({
 
         pruneStalePendingActions();
 
-        const sessionKey = ctx.sessionKey ?? "";
+        const key = correlationKey(ctx);
         const channelId = ctx.channelId ?? "unknown";
-        const agentId = resolveAgentId(sessionKey);
 
         // 1. Store pending action — will be promoted to agent_reply on message_sent
-        if (flags.enableActionLogging && sessionKey) {
-          pendingActions.set(sessionKey, {
-            sessionKey,
+        if (flags.enableActionLogging) {
+          pendingActions.set(key, {
+            correlationKey: key,
             channelId,
             from: event.from ?? "unknown",
             receivedAt: Date.now(),
@@ -249,11 +265,11 @@ export default definePluginEntry({
         }
 
         // 2. Correlate with prior agent actions → user_replied outcome
-        if (flags.enableOutcomeLogging && sessionKey) {
-          const sessionActions = recentConfirmedActions.get(sessionKey);
-          if (sessionActions) {
+        if (flags.enableOutcomeLogging) {
+          const priorActions = recentConfirmedActions.get(key);
+          if (priorActions) {
             const now = Date.now();
-            for (const action of sessionActions) {
+            for (const action of priorActions) {
               if (action.correlated) continue;
               const elapsed = now - action.sentAt;
               if (elapsed > MAX_CORRELATION_AGE_MS) continue;
@@ -269,13 +285,13 @@ export default definePluginEntry({
               });
             }
             // Prune old/correlated entries
-            const pruned = sessionActions.filter(
+            const pruned = priorActions.filter(
               (a) => !a.correlated && now - a.sentAt < MAX_CORRELATION_AGE_MS,
             );
             if (pruned.length > 0) {
-              recentConfirmedActions.set(sessionKey, pruned);
+              recentConfirmedActions.set(key, pruned);
             } else {
-              recentConfirmedActions.delete(sessionKey);
+              recentConfirmedActions.delete(key);
             }
           }
         }
@@ -298,18 +314,17 @@ export default definePluginEntry({
 
         pruneStalePendingActions();
 
-        const sessionKey = ctx.sessionKey ?? "";
+        const key = correlationKey(ctx);
         const channelId = ctx.channelId ?? "unknown";
-        const agentId = resolveAgentId(sessionKey);
 
         if (flags.enableActionLogging) {
           // Promote pending inbound → confirmed agent_reply
-          const pending = pendingActions.get(sessionKey);
-          pendingActions.delete(sessionKey);
+          const pending = pendingActions.get(key);
+          pendingActions.delete(key);
 
           const { actionId } = await engine.logAction({
             agentId,
-            sessionKey,
+            sessionKey: key,
             actionType: "agent_reply",
             channelId,
             accountId: ctx.accountId,
@@ -321,13 +336,13 @@ export default definePluginEntry({
           });
 
           // Track for future outcome correlation
-          if (!recentConfirmedActions.has(sessionKey)) {
-            recentConfirmedActions.set(sessionKey, []);
+          if (!recentConfirmedActions.has(key)) {
+            recentConfirmedActions.set(key, []);
           }
-          const list = recentConfirmedActions.get(sessionKey)!;
+          const list = recentConfirmedActions.get(key)!;
           list.push({
             actionId,
-            sessionKey,
+            correlationKey: key,
             channelId,
             sentAt: Date.now(),
             correlated: false,
