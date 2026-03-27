@@ -121,6 +121,12 @@ export default definePluginEntry({
         });
         engine.start();
 
+        console.error("[dhanoosh] engine started", JSON.stringify({
+          mode: engine.getMode(),
+          home: engine.getHome(),
+          agentId,
+        }));
+
         const engineMode = engine.getMode();
         if (engineMode === "off") {
           setPolicyFeedbackEngine(null, "off");
@@ -238,6 +244,11 @@ export default definePluginEntry({
 
     // --- message_received: store pending + correlate outcomes ---
     api.on("message_received", async (event, ctx) => {
+      console.error("[dhanoosh] message_received fired", JSON.stringify({
+        channelId: ctx.channelId,
+        conversationId: ctx.conversationId,
+        hasEngine: !!engine,
+      }));
       if (!engine) {
         return;
       }
@@ -302,6 +313,12 @@ export default definePluginEntry({
 
     // --- message_sent: log agent_reply action + immediate delivery outcome ---
     api.on("message_sent", async (event, ctx) => {
+      console.error("[dhanoosh] message_sent fired", JSON.stringify({
+        channelId: ctx.channelId,
+        conversationId: ctx.conversationId,
+        to: event.to,
+        hasEngine: !!engine,
+      }));
       if (!engine) {
         return;
       }
